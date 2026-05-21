@@ -1,4 +1,4 @@
-# LLM-Project — Video Fingerprinting via Encrypted Network Traffic
+# LLM-Project : Video Fingerprinting via Encrypted Network Traffic
 
 A GPT-based system that identifies which video a user is watching by analysing patterns in encrypted HTTPS traffic — no packet contents required.
 
