@@ -31,7 +31,7 @@ Raw .log files
 
 ---
 
-## Model Architecture — TrafficGPT
+## Model Architecture : TrafficGPT
 
 | Hyperparameter | Value |
 |---|---|
@@ -72,10 +72,10 @@ Causal language modelling (next-token prediction) on all 1000 traffic sequences 
 ### Fine-tuning (`fine-tuning.py`)
 Two-phase transfer learning:
 
-**Phase 1 - Frozen backbone (20 epochs)**  
+**Phase 1 Frozen backbone (20 epochs)**  
 Only the classification head is trained (LR = 1e-3). Fast convergence.
 
-**Phase 2 - Full fine-tune (60 epochs)**  
+**Phase 2  Full fine-tune (60 epochs)**  
 Backbone unfrozen with differential learning rates (head: 1e-4, backbone: 1e-5) to preserve pre-trained representations.
 
 ---
