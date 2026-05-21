@@ -6,7 +6,7 @@ A GPT-based system that identifies which video a user is watching by analysing p
 
 ## Overview
 
-Modern video streaming is delivered over encrypted HTTPS, making content inspection impossible. However, the *timing and volume patterns* of traffic — how many bytes arrive in each 100ms window — leave a distinctive fingerprint for each video. This project trains a custom GPT (TrafficGPT) to learn those fingerprints and classify 100 videos with high accuracy.
+Modern video streaming is delivered over encrypted HTTPS, making content inspection impossible. However, the timing and volume patterns of traffic - how many bytes arrive in each 100ms window - leave a distinctive fingerprint for each video. This project trains a custom GPT (TrafficGPT) to learn those fingerprints and classify 100 videos with high accuracy.
 
 ### Pipeline
 
