@@ -1,4 +1,35 @@
-###############trial phase 92% accurcay
+"""
+Part 3 — Fine-tune for Video Classification
+Video Fingerprinting via Encrypted Network Traffic
+
+Takes the pre-trained TrafficGPT backbone from Part 2 and adds a
+classification head to identify which of the 100 videos a traffic
+sequence belongs to.
+
+Architecture:
+  Backbone  : pre-trained TrafficGPT  (frozen in Phase 1, unfrozen in Phase 2)
+  Pooling   : learned attention pooling over content windows (pos 1..600),
+              silent windows masked out of the attention softmax
+  Head      : LayerNorm(256) → Linear(256 → 256) → GELU → Dropout(0.3) → Linear(256 → 100)
+
+Two-phase fine-tuning:
+  Phase 1 — frozen backbone (20 epochs, lr=1e-3)
+    Train only the classification head.
+    The backbone's representations are used as-is.
+    Fast convergence, sets a strong baseline.
+
+  Phase 2 — full fine-tune (100 epochs, backbone lr=1e-5, head lr=1e-4)
+    Unfreeze the entire backbone with a 10× lower LR than the head.
+    Allows the backbone to adapt its representations to the classification task
+    without destroying the pre-trained knowledge (differential learning rates).
+
+Evaluation metrics (on 100 held-out test sequences):
+  - Top-1 accuracy   (primary metric)
+  - Top-5 accuracy   (is the correct video in the top-5 predictions?)
+  - Per-class accuracy
+  - Confusion matrix (saved to disk)
+"""
+
 import os, sys, json, pickle, math, time
 import numpy as np
 import torch
@@ -21,9 +52,9 @@ class FTConfig:
     ckpt_dir       : str   = "./checkpoints"
     pretrain_ckpt  : str   = "./checkpoints/best_pretrain.pt"
     num_classes    : int   = 100
-    pool           : str   = "burst"   # ← changed from "mean" to "burst"
+    pool           : str   = "attention"  # "attention" | "mean" | "last"
     head_dropout   : float = 0.3
-    label_smoothing: float = 0.1       # ← new
+    label_smoothing: float = 0.1
     # phase 1 — frozen backbone
     p1_epochs      : int   = 20
     p1_lr          : float = 1e-3
@@ -54,38 +85,53 @@ class ClassificationDataset(Dataset):
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+# This definition MUST stay identical to the one in evaluate.py so that training
+# and evaluation agree and best_finetune.pt is reproducible.
+class AttentionPool(nn.Module):
+    """Learned attention pooling: a per-position score → softmax → weighted sum."""
+    def __init__(self, d_model):
+        super().__init__()
+        self.scorer = nn.Linear(d_model, 1, bias=False)
+
+    def forward(self, content_h, valid_mask=None):
+        scores = self.scorer(content_h).squeeze(-1)             # (B, T)
+        if valid_mask is not None:
+            scores = scores.masked_fill(~valid_mask, float("-inf"))
+        w = torch.softmax(scores, dim=1).unsqueeze(-1)          # (B, T, 1)
+        return (w * content_h).sum(dim=1)                       # (B, d)
+
+
 class TrafficClassifier(nn.Module):
 
-    def __init__(self, backbone, num_classes, pool="burst",
+    def __init__(self, backbone, num_classes, pool="attention",
                  head_dropout=0.3, silent_token_id=255):
         super().__init__()
         self.backbone        = backbone
         self.pool            = pool
         self.silent_token_id = silent_token_id
         d = backbone.cfg.d_model
+        self.attn_pool  = AttentionPool(d)
         self.classifier = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Dropout(head_dropout),
-            nn.Linear(d, num_classes),
+            nn.LayerNorm(d),            # .0
+            nn.Linear(d, d),            # .1
+            nn.GELU(),                  # .2
+            nn.Dropout(head_dropout),   # .3
+            nn.Linear(d, num_classes),  # .4
         )
 
     def forward(self, input_ids):
 
         h = self.backbone.get_hidden_states(input_ids)   # (B, 602, d)
+        content_h = h[:, 1:601, :]                        # (B, 600, d)  skip BOS/EOS
 
-        if self.pool == "burst":
-            # Mask out silent positions (pos 1..600, skip BOS at 0 and EOS at 601)
-            content_ids  = input_ids[:, 1:601]                       # (B, 600)
-            burst_mask   = (content_ids != self.silent_token_id)     # (B, 600) bool
-            content_h    = h[:, 1:601, :]                            # (B, 600, d)
-
-            # If a sequence has zero burst windows (shouldn't happen), fall back to mean
-            burst_counts = burst_mask.sum(dim=1, keepdim=True).clamp(min=1).float()
-            rep = (content_h * burst_mask.unsqueeze(-1).float()).sum(dim=1) \
-                  / burst_counts                                      # (B, d)
-
-        else:  # "mean" — original behaviour
-            rep = h[:, 1:601, :].mean(dim=1)
+        if self.pool == "attention":
+            # Attention over content tokens, silent windows masked out of the softmax.
+            mask = (input_ids[:, 1:601] != self.silent_token_id)     # (B, 600) bool
+            rep  = self.attn_pool(content_h, mask)                   # (B, d)
+        elif self.pool == "mean":
+            rep = content_h.mean(dim=1)
+        else:                                             # "last" / "eos"
+            rep = h[:, -1, :]
 
         return self.classifier(rep)
 
@@ -130,7 +176,7 @@ def evaluate(model, loader, device, label_smoothing=0.0):
 def run_phase(model, train_loader, val_loader, device,
               n_epochs, lr_head, lr_backbone, cfg, tag):
 
-    head_params     = list(model.classifier.parameters())
+    head_params     = list(model.classifier.parameters()) + list(model.attn_pool.parameters())
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
 
     param_groups = [{"params": head_params, "lr": lr_head}]
@@ -312,7 +358,7 @@ def smoke_test():
     cfg      = PretrainConfig()
     backbone = TrafficGPT(cfg)
 
-    for pool in ("burst", "mean"):
+    for pool in ("attention", "mean"):
         model  = TrafficClassifier(backbone, 100, pool=pool, silent_token_id=255)
         dummy  = torch.randint(0, 260, (4, 602))
         logits = model(dummy)
