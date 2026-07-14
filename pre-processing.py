@@ -1,32 +1,3 @@
-"""
-Part 1 — Data Preprocessing Pipeline
-Video Fingerprinting via Encrypted Network Traffic
-
-Tokenization design (VQ / K-means codebook):
-  - Each 100ms window has 6 raw features → normalise → K-means cluster
-  - Each window maps to its nearest centroid ID  →  ONE token per window
-  - This preserves the temporal structure of the time-series:
-      window 0  → token t0
-      window 1  → token t1
-      ...
-      window 599→ token t599
-  - Sequence per trace: [BOS] t0 t1 ... t599 [EOS]  (length 602)
-  - Special tokens: PAD=K, BOS=K+1, EOS=K+2, CLS=K+3
-  - Default K=256  → vocab_size = 260
-
-Why K-means (VQ codebook)?
-  - Analogous to BPE in NLP: learns the most frequent joint patterns
-    across all 6 features simultaneously
-  - Single token per window keeps adjacent windows at distance 1 in
-    the sequence, so the GPT can directly learn burst/silence rhythms,
-    segment-download cycles, and bitrate adaptation curves
-
-No leakage: the scaler + K-means codebook are fit on the TRAIN split only
-(same stratified split later used by pre-train.py, computed here first so
-both stages agree). Val/test traces are only ever *transformed* with the
-already-fitted scaler/kmeans, never seen during fitting.
-"""
-
 import os, json
 import numpy as np
 import pandas as pd
