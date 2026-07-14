@@ -20,16 +20,22 @@ Why K-means (VQ codebook)?
   - Single token per window keeps adjacent windows at distance 1 in
     the sequence, so the GPT can directly learn burst/silence rhythms,
     segment-download cycles, and bitrate adaptation curves
-  - Fitting on all training files ensures the codebook covers the full
-    distribution of traffic patterns across every video class
+
+No leakage: the scaler + K-means codebook are fit on the TRAIN split only
+(same stratified split later used by pre-train.py, computed here first so
+both stages agree). Val/test traces are only ever *transformed* with the
+already-fitted scaler/kmeans, never seen during fitting.
 """
 
 import os, json
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from collections import defaultdict
 from sklearn.cluster    import MiniBatchKMeans
 from sklearn.preprocessing import StandardScaler
+
+from model import Config
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SIXTY_S_NS    = 60_000_000_000
@@ -40,6 +46,31 @@ K             = 256                # codebook size (tune-able)
 
 FEATURE_NAMES = ["bytes_in", "bytes_out", "pkts_in",
                  "pkts_out", "avg_size_in", "gap_before_burst_ms"]
+
+SEED = 42
+_SPLIT_CFG = Config()
+TRAIN_K, VAL_K, TEST_K = _SPLIT_CFG.train_k, _SPLIT_CFG.val_k, _SPLIT_CFG.test_k
+
+
+# ── Stratified split (must match pre-train.py exactly — same seed/logic) ─────
+def stratified_split(y: np.ndarray, train_k: int, val_k: int, test_k: int, seed: int = SEED):
+    rng = np.random.default_rng(seed)
+    class_indices = defaultdict(list)
+    for idx, label in enumerate(y):
+        class_indices[int(label)].append(idx)
+
+    train_idx, val_idx, test_idx = [], [], []
+    for label, indices in sorted(class_indices.items()):
+        n = len(indices)
+        assert n == train_k + val_k + test_k, \
+            f"Class {label} has {n} samples, expected {train_k+val_k+test_k}"
+        perm     = rng.permutation(n)
+        shuffled = [indices[i] for i in perm]
+        train_idx.extend(shuffled[:train_k])
+        val_idx.extend(shuffled[train_k:train_k + val_k])
+        test_idx.extend(shuffled[train_k + val_k:])
+
+    return train_idx, val_idx, test_idx
 
 
 # ── Step 1: Parse log ─────────────────────────────────────────────────────────
@@ -91,6 +122,8 @@ def extract_features(df: pd.DataFrame) -> np.ndarray:
 def build_codebook(all_features: np.ndarray, k: int = K) -> dict:
     """
     Fit StandardScaler + MiniBatchKMeans on non-empty windows only.
+    `all_features` must come from TRAIN traces only (see build_dataset) —
+    fitting on val/test traces would leak their distribution into the codebook.
     Empty windows (all features == 0) are assigned a dedicated SILENT token (K-1)
     so K-means centroids are not wasted on near-zero noise.
     Special tokens: PAD=K, BOS=K+1, EOS=K+2, CLS=K+3  → vocab_size = K+4
@@ -199,23 +232,30 @@ def build_dataset(log_dir: str, output_dir: str = "./data") -> dict:
         video_ids.append(vid)
         print(f"  {fp.parent.name}/{fp.name}  video={vid}  pkts={len(df)}")
 
-    # Fit codebook on ALL data combined
-    all_feat = np.vstack(raw_features)
-    vocab    = build_codebook(all_feat)
-    print(f"\nCodebook ready: vocab_size={vocab['vocab_size']}")
-    print(f"  Active centroids: 0 – {vocab['k']-2}   Silent: {vocab['silent']}")
-    print(f"  Special tokens  : {vocab['special']}")
-
-    # Tokenize every trace → shape (N, 602)
-    X = np.vstack([tokenize(f, vocab) for f in raw_features])
-    print(f"\nToken matrix: {X.shape}   (traces × seq_len)")
-    print(f"Token range : [{X.min()}, {X.max()}]")
-
     # Labels — sort numerically by folder index
     unique_vids = sorted(set(video_ids), key=int)
     label_map   = {v: i for i, v in enumerate(unique_vids)}
     y = np.array([label_map[v] for v in video_ids], dtype=np.int64)
     print(f"Classes: {len(label_map)}")
+
+    # Stratified split FIRST — computed here so the codebook can be fit on
+    # train traces only. pre-train.py loads these same indices (does not
+    # recompute them) so training/val/test downstream match exactly.
+    train_idx, val_idx, test_idx = stratified_split(y, TRAIN_K, VAL_K, TEST_K)
+    print(f"Split       : {len(train_idx)} train / {len(val_idx)} val / {len(test_idx)} test "
+          f"({TRAIN_K}/{VAL_K}/{TEST_K} per class)")
+
+    # Fit codebook on TRAIN traces only — val/test never influence the scaler/kmeans
+    train_feat = np.vstack([raw_features[i] for i in train_idx])
+    vocab      = build_codebook(train_feat)
+    print(f"\nCodebook ready: vocab_size={vocab['vocab_size']}  (fit on {len(train_idx)} train traces)")
+    print(f"  Active centroids: 0 – {vocab['k']-2}   Silent: {vocab['silent']}")
+    print(f"  Special tokens  : {vocab['special']}")
+
+    # Tokenize every trace (train/val/test) with the train-fitted vocab → shape (N, 602)
+    X = np.vstack([tokenize(f, vocab) for f in raw_features])
+    print(f"\nToken matrix: {X.shape}   (traces × seq_len)")
+    print(f"Token range : [{X.min()}, {X.max()}]")
 
     # Sanity check (only meaningful with multiple classes)
     if len(label_map) > 1:
@@ -226,6 +266,9 @@ def build_dataset(log_dir: str, output_dir: str = "./data") -> dict:
     os.makedirs(output_dir, exist_ok=True)
     np.save(f"{output_dir}/X_tokens.npy",  X)
     np.save(f"{output_dir}/y_labels.npy",  y)
+    np.save(f"{output_dir}/split_train_idx.npy", np.array(train_idx))
+    np.save(f"{output_dir}/split_val_idx.npy",   np.array(val_idx))
+    np.save(f"{output_dir}/split_test_idx.npy",  np.array(test_idx))
     with open(f"{output_dir}/vocab.pkl",   "wb") as f:
         pickle.dump({"scaler": vocab["scaler"], "kmeans": vocab["kmeans"],
                      "k": vocab["k"], "special": vocab["special"],
@@ -233,7 +276,8 @@ def build_dataset(log_dir: str, output_dir: str = "./data") -> dict:
     with open(f"{output_dir}/label_map.json", "w") as f:
         json.dump(label_map, f, indent=2)
     print(f"\nSaved to {output_dir}/")
-    return {"X": X, "y": y, "vocab": vocab, "label_map": label_map}
+    return {"X": X, "y": y, "vocab": vocab, "label_map": label_map,
+            "train_idx": train_idx, "val_idx": val_idx, "test_idx": test_idx}
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
