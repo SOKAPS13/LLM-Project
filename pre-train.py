@@ -74,21 +74,45 @@ def get_lr(step, cfg, steps_per_epoch):
 
 # ── Train / eval helpers ──────────────────────────────────────────────────────
 def compute_loss(model, batch, device):
+    """
+    Returns (loss, n_tokens):
+      loss     — mean CE over the non-ignored target tokens in this batch
+      n_tokens — number of non-ignored (!= -100) target tokens
+
+    n_tokens lets callers form a token-weighted average across batches, so a
+    short trailing batch is not weighted equally with a full one. This matters
+    here because best-checkpoint selection rides on the val loss and the val
+    set is tiny (val_k=1 → 100 sequences).
+    """
     inp, tgt = batch
     inp, tgt = inp.to(device), tgt.to(device)
     logits   = model(inp)
     B, T, V  = logits.shape
-    return nn.CrossEntropyLoss(ignore_index=-100)(
+    loss = nn.CrossEntropyLoss(ignore_index=-100)(
         logits.view(B * T, V), tgt.view(B * T))
+    n_tokens = int((tgt != -100).sum().item())
+    return loss, n_tokens
+
 
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
-    total, n = 0.0, 0
+    total_loss, total_tokens = 0.0, 0
     for batch in loader:
-        total += compute_loss(model, batch, device).item(); n += 1
+        loss, n_tokens = compute_loss(model, batch, device)
+        total_loss   += loss.item() * n_tokens
+        total_tokens += n_tokens
     model.train()
-    return total / max(1, n)
+    return total_loss / max(1, total_tokens)
+
+
+def cfg_to_dict(cfg) -> dict:
+    """Full config snapshot: class-level defaults + any instance overrides.
+    (Config declares its fields as class attributes, so cfg.__dict__ alone
+    would miss the architecture — d_model, n_layers, etc.)"""
+    keys = set(vars(type(cfg))) | set(vars(cfg))
+    return {k: getattr(cfg, k) for k in keys
+            if not k.startswith("__") and not callable(getattr(cfg, k))}
 
 
 # ── Main training loop ────────────────────────────────────────────────────────
@@ -107,9 +131,12 @@ def train(cfg: Config = CFG):
     full_ds = TrafficDataset(cfg.data_dir, vocab_cfg)
     y_all   = full_ds.labels.numpy()
 
-    # Stratified split
-    train_idx, val_idx, test_idx = stratified_split(
-        y_all, cfg.train_k, cfg.val_k, cfg.test_k)
+    # Split indices are computed in pre-processing.py — BEFORE the scaler/K-means
+    # codebook is fit — so that fitting only ever sees train traces. We load
+    # (not recompute) them here so training uses the exact same split.
+    train_idx = np.load(f"{cfg.data_dir}/split_train_idx.npy").tolist()
+    val_idx   = np.load(f"{cfg.data_dir}/split_val_idx.npy").tolist()
+    test_idx  = np.load(f"{cfg.data_dir}/split_test_idx.npy").tolist()
     train_ds = Subset(full_ds, train_idx)
     val_ds   = Subset(full_ds, val_idx)
     test_ds  = Subset(full_ds, test_idx)
@@ -148,7 +175,7 @@ def train(cfg: Config = CFG):
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
-        ep_loss, n = 0.0, 0
+        ep_loss, ep_tokens = 0.0, 0
         t0 = time.time()
 
         for batch in train_loader:
@@ -156,14 +183,18 @@ def train(cfg: Config = CFG):
             for pg in optimizer.param_groups: pg["lr"] = lr
 
             optimizer.zero_grad()
-            loss = compute_loss(model, batch, device)
+            loss, n_tokens = compute_loss(model, batch, device)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
 
-            ep_loss += loss.item(); n += 1; global_step += 1
+            # Token-weighted accumulation: matches the eval convention so that
+            # the reported train/val losses are on the same scale.
+            ep_loss   += loss.item() * n_tokens
+            ep_tokens += n_tokens
+            global_step += 1
 
-        train_loss = ep_loss / n
+        train_loss = ep_loss / max(1, ep_tokens)
         val_loss   = evaluate(model, val_loader, device)
         elapsed    = time.time() - t0
 
@@ -182,13 +213,13 @@ def train(cfg: Config = CFG):
             torch.save({
                 "epoch": epoch, "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "val_loss": val_loss, "cfg": cfg.__dict__,
+                "val_loss": val_loss, "cfg": cfg_to_dict(cfg),
             }, f"{cfg.output_dir}/best_pretrain.pt")
 
         if epoch % cfg.save_every == 0:
             torch.save({
                 "epoch": epoch, "model_state": model.state_dict(),
-                "val_loss": val_loss, "cfg": cfg.__dict__,
+                "val_loss": val_loss, "cfg": cfg_to_dict(cfg),
             }, f"{cfg.output_dir}/pretrain_epoch{epoch}.pt")
 
     with open(f"{cfg.output_dir}/pretrain_history.json", "w") as f:
@@ -215,7 +246,8 @@ def smoke_test():
     y_dummy = np.repeat(np.arange(100), 10)
     ti, vi, tsi = stratified_split(y_dummy, 8, 1, 1)
     print(f"\nStratified split: train={len(ti)} / val={len(vi)} / test={len(tsi)}  ✓")
-    assert not set(ti) & set(vi) & set(tsi), "Split indices overlap!"
+    assert not (set(ti) & set(vi)) and not (set(vi) & set(tsi)) \
+        and not (set(ti) & set(tsi)), "Split indices overlap!"
     print(f"No overlap between splits  ✓")
 
     # Forward pass
